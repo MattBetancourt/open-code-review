@@ -471,6 +471,58 @@ async function publishBatch({
       log("Batch review not found on server. Falling back to per-comment posting...");
     }
 
+    if (batchStatus === 422 && toRetry.length > 0) {
+      log(`[422-fallback] Batch createReview rejected due to line validation error (HTTP 422). Filtering unresolvable comments against PR diff hunks...`);
+      let fileHunkMap = null;
+      try {
+        fileHunkMap = await getPrDiffHunks({ github, owner, repo, prNumber, log });
+      } catch (hunkErr) {
+        log(`[422-fallback] Failed to fetch PR diff hunks (${hunkErr.message}); proceeding without diff hunk filter.`);
+      }
+
+      let validToRetry = toRetry;
+      if (fileHunkMap) {
+        validToRetry = [];
+        for (const item of toRetry) {
+          if (isCommentInDiffHunks(item, fileHunkMap)) {
+            validToRetry.push(item);
+          } else {
+            failed++;
+            failedComments.push({
+              comment: item.comment,
+              error: `Line ${item.reviewComment.line || "n/a"} could not be resolved (outside PR diff hunks)`,
+            });
+            log(`[422-fallback] Comment for ${item.reviewComment.path}:${item.reviewComment.line} is outside PR diff hunks; routing to summary failure.`);
+          }
+        }
+      }
+
+      if (validToRetry.length > 0) {
+        log(`[422-fallback] Attempting secondary filtered batch createReview with ${validToRetry.length} valid comment(s)...`);
+        try {
+          const secondaryRes = await github.rest.pulls.createReview({
+            owner,
+            repo,
+            pull_number: prNumber,
+            commit_id: commitSha,
+            body: reviewBody,
+            event: "COMMENT",
+            comments: validToRetry.map(({ reviewComment }) => reviewComment),
+          });
+          succeeded += validToRetry.length;
+          log(`Successfully posted secondary filtered review batch with ${validToRetry.length} inline comment(s).`);
+          logRateLimitQuota(secondaryRes, "after secondary batch createReview", log);
+          return { succeeded, failed, failedComments, reconciled };
+        } catch (secondaryE) {
+          log(`Secondary filtered batch createReview failed (HTTP ${secondaryE.status || "n/a"}): ${secondaryE.message}. Falling back to per-comment loop.`);
+          toRetry = validToRetry;
+        }
+      } else {
+        log(`[422-fallback] All ${toRetry.length} comment(s) in batch were outside PR diff hunks; skipping createReview.`);
+        return { succeeded, failed, failedComments, reconciled };
+      }
+    }
+
     for (const { comment, reviewComment, id } of toRetry) {
       let posted = false;
       for (let attempt = 0; attempt <= MAX_RETRIES && !posted; attempt++) {
@@ -1529,6 +1581,82 @@ function safeRead(fs, p) {
   }
 }
 
+function parseDiffHunkLines(patch) {
+  if (!patch) return new Set();
+  const validLines = new Set();
+  const hunkHeaderRegex = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+  const lines = patch.split("\n");
+  let currentLine = 0;
+  let inHunk = false;
+
+  for (const line of lines) {
+    const match = hunkHeaderRegex.exec(line);
+    if (match) {
+      currentLine = parseInt(match[1], 10);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+
+    if (line.startsWith("+") || line.startsWith(" ")) {
+      validLines.add(currentLine);
+      currentLine++;
+    } else if (line.startsWith("-")) {
+      // Deleted line in old file, does not advance new file line counter
+    } else if (line.startsWith("\\ No newline at end of file")) {
+      // Ignored
+    }
+  }
+  return validLines;
+}
+
+function isCommentInDiffHunks(item, fileHunkMap) {
+  const { reviewComment } = item;
+  const path = reviewComment.path;
+  const validLines = fileHunkMap.get(path);
+  if (!validLines) return false;
+
+  const endLine = reviewComment.line;
+  const startLine = reviewComment.start_line != null ? reviewComment.start_line : endLine;
+
+  if (endLine != null && !validLines.has(endLine)) return false;
+  if (startLine != null && !validLines.has(startLine)) return false;
+  return true;
+}
+
+async function getPrDiffHunks({ github, owner, repo, prNumber, log }) {
+  const fileHunkMap = new Map();
+  if (!github || !github.paginate || !github.paginate.iterator) {
+    if (github && github.rest && github.rest.pulls && github.rest.pulls.listFiles) {
+      const res = await github.rest.pulls.listFiles({ owner, repo, pull_number: prNumber, per_page: 100 });
+      const files = (res && res.data) || [];
+      for (const file of files) {
+        if (file.filename && file.patch) {
+          fileHunkMap.set(file.filename, parseDiffHunkLines(file.patch));
+        }
+      }
+    }
+    return fileHunkMap;
+  }
+
+  const iterator = github.paginate.iterator(github.rest.pulls.listFiles, {
+    owner,
+    repo,
+    pull_number: prNumber,
+    per_page: 100,
+  });
+
+  for await (const response of iterator) {
+    const files = (response && response.data) || [];
+    for (const file of files) {
+      if (file.filename && file.patch) {
+        fileHunkMap.set(file.filename, parseDiffHunkLines(file.patch));
+      }
+    }
+  }
+  return fileHunkMap;
+}
+
 module.exports = {
   runPostReviewComments,
   postSummary,
@@ -1579,4 +1707,7 @@ module.exports = {
   CATEGORIES,
   SEVERITIES,
   SEVERITY_RANK,
+  parseDiffHunkLines,
+  isCommentInDiffHunks,
+  getPrDiffHunks,
 };

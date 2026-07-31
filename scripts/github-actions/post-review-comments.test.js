@@ -12,7 +12,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkLines, isCommentInDiffHunks, getPrDiffHunks } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -97,6 +97,7 @@ function makeGithub(opts = {}) {
   const listCommentsCalls = [];
   const listReviewCommentsCalls = [];
   const listReviewsCalls = [];
+  const listFilesCalls = [];
   // Interleaved log of write operations (createReview / createComment /
   // updateComment) in call order, so tests can assert positioning invariants
   // such as "summary created before review" without timing the calls.
@@ -153,6 +154,7 @@ function makeGithub(opts = {}) {
     listCommentsCalls,
     listReviewCommentsCalls,
     listReviewsCalls,
+    listFilesCalls,
     ops,
     rest: {
       users: {
@@ -231,6 +233,10 @@ function makeGithub(opts = {}) {
           }
           return { data: opts.reviews || [] };
         },
+        listFiles: async (params) => {
+          listFilesCalls.push(params);
+          return { data: opts.files || [] };
+        },
         listReviewComments: async (params) => {
           listReviewCommentsCalls.push(params);
           if (opts.listReviewCommentsThrow) {
@@ -283,6 +289,19 @@ function makeGithub(opts = {}) {
           return { data: { id: params.comment_id, html_url: `http://ex/u${updatedComments.length}` } };
         },
       },
+    paginate: {
+      iterator: (fn, params) => {
+        if (fn === mockObj.rest.pulls.listFiles) {
+          const data = opts.files || [];
+          return (async function* () {
+            yield { data };
+          })();
+        }
+        return (async function* () {
+          yield { data: [] };
+        })();
+      },
+    },
     },
   };
 }
@@ -2120,8 +2139,92 @@ async function main() {
   await testAccountingReconcilesToTotal();
   await testMalformedRoutingPolicyFailsOpen();
   await testRoutedFindingsCarryNoIdempotencyId();
+  // Diff hunk parsing & 422 fallback
+  testParseDiffHunkLines();
+  testIsCommentInDiffHunks();
+  await testGetPrDiffHunks();
+  await testHttp422SecondaryFilteredBatchFallback();
   console.log("All post-review-comments tests passed.");
 }
+function testParseDiffHunkLines() {
+  const patch = `@@ -10,3 +10,4 @@
+ context line 10
+-deleted line 11
++added line 11
++added line 12
+ context line 13`;
+  const valid = parseDiffHunkLines(patch);
+  assert.strictEqual(valid.has(10), true);
+  assert.strictEqual(valid.has(11), true);
+  assert.strictEqual(valid.has(12), true);
+  assert.strictEqual(valid.has(13), true);
+  assert.strictEqual(valid.has(14), false);
+  assert.strictEqual(valid.has(9), false);
+  assert.strictEqual(parseDiffHunkLines("").size, 0);
+}
+
+function testIsCommentInDiffHunks() {
+  const hunkMap = new Map();
+  hunkMap.set("foo.js", new Set([10, 11, 12]));
+  const itemValid = { reviewComment: { path: "foo.js", line: 11 } };
+  const itemInvalid = { reviewComment: { path: "foo.js", line: 50 } };
+  const itemMissingFile = { reviewComment: { path: "bar.js", line: 10 } };
+
+  assert.strictEqual(isCommentInDiffHunks(itemValid, hunkMap), true);
+  assert.strictEqual(isCommentInDiffHunks(itemInvalid, hunkMap), false);
+  assert.strictEqual(isCommentInDiffHunks(itemMissingFile, hunkMap), false);
+}
+
+async function testGetPrDiffHunks() {
+  const files = [{ filename: "src/main.js", patch: "@@ -1,2 +1,2 @@\n context 1\n+added 2" }];
+  const gh = makeGithub({ files });
+  const hunkMap = await getPrDiffHunks({ github: gh, owner: "owner", repo: "repo", prNumber: 123 });
+  assert.strictEqual(hunkMap.has("src/main.js"), true);
+  assert.strictEqual(hunkMap.get("src/main.js").has(2), true);
+}
+
+async function testHttp422SecondaryFilteredBatchFallback() {
+  const files = [
+    { filename: "src/valid.js", patch: "@@ -1,2 +1,2 @@\n context 1\n+added 2" },
+  ];
+  const result = {
+    comments: [
+      { path: "src/valid.js", start_line: 2, end_line: 2, severity: "high", category: "bug", comment: "valid comment" },
+      { path: "src/invalid.js", start_line: 99, end_line: 99, severity: "high", category: "bug", comment: "out of diff comment" },
+    ],
+  };
+
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [{ message: "Line could not be resolved", status: 422 }],
+  });
+  const core = { setOutput() {} };
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core,
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  // Initial batch createReview failed with 422.
+  // Secondary batch createReview was attempted with ONLY the surviving valid comment (src/valid.js).
+  // Verify createReviewCalls:
+  // Call #0: initial batch (body === REVIEW_TAG, 2 comments) -> threw 422.
+  // Call #1: secondary filtered batch (body === REVIEW_TAG, 1 valid comment src/valid.js) -> succeeded!
+  assert.strictEqual(gh.createReviewCalls.length, 2, "Expected 2 createReview calls (initial batch + secondary filtered batch)");
+  const secondaryCall = gh.createReviewCalls[1];
+  assert.strictEqual(secondaryCall.comments.length, 1, "Secondary batch should contain only 1 valid comment");
+  assert.strictEqual(secondaryCall.comments[0].path, "src/valid.js");
+
+  assert.strictEqual(gh.updatedComments.length, 1);
+  const summaryText = gh.updatedComments[0].body;
+  assert.strictEqual(summaryText.includes("Successfully posted inline: 1 comment(s)"), true);
+  assert.strictEqual(summaryText.includes("Failed to post inline: 1 comment(s)"), true);
+  assert.strictEqual(summaryText.includes("Line 99 could not be resolved"), true);
+}
+
 
 main().catch((err) => {
   console.error(err);
