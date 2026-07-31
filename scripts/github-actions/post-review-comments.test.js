@@ -12,7 +12,7 @@
 
 const assert = require("assert");
 const path = require("path");
-const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkLines, isCommentInDiffHunks, getPrDiffHunks } = require(path.join(__dirname, "post-review-comments.js"));
+const { runPostReviewComments, safeFence, fencedBlock, lineSpan, sameCommentSpan, overlapsHistory, resolveThreshold, DEFAULT_OVERLAP_THRESHOLD, newCommentId, getPostedCommentIds, computeRetryDelayMs, formatWarnings, resolveBatchSize, sortToSendDeterministically, chunkArray, buildRunTags, DEFAULT_BATCH_SIZE, buildBadge, sanitizeMetadata, buildPolicy, routeComment, formatComment, formatCommentMarkdown, NO_ROUTING, CATEGORIES, SEVERITIES, SEVERITY_RANK, parseDiffHunkRanges, classifyCommentAgainstDiff, describeCommentLocation, isLineResolutionFailure, getPrDiffHunks } = require(path.join(__dirname, "post-review-comments.js"));
 
 // REVIEW_TAG as the production code builds it for this test's hardcoded run
 // identity (context.runId=undefined -> 0, runAttempt=undefined -> 1). Used as
@@ -235,7 +235,15 @@ function makeGithub(opts = {}) {
         },
         listFiles: async (params) => {
           listFilesCalls.push(params);
-          return { data: opts.files || [] };
+          if (opts.listFilesThrow) {
+            throw makeErr(opts.listFilesError || "listFiles unavailable", opts.listFilesStatus || 503);
+          }
+          // Honor page/per_page so tests can exercise the multi-page walk and
+          // the >MAX_PAGES truncation guard, not just a single short page.
+          const all = opts.files || [];
+          const perPage = params.per_page || 100;
+          const page = params.page || 1;
+          return { data: all.slice((page - 1) * perPage, page * perPage) };
         },
         listReviewComments: async (params) => {
           listReviewCommentsCalls.push(params);
@@ -248,6 +256,29 @@ function makeGithub(opts = {}) {
           //   - landedKeys: per-comment calls (index >= 1) that landed despite
           //     a 5xx/network error — drives per-comment isCommentAlreadyPosted.
           // Deduping by embedded comment id keeps them composable.
+          // echoBatchIdx: echo ONLY the comments carried by batch call #N
+          // (0-based among batch calls). Needed to simulate "the SECONDARY
+          // filtered batch landed but its response was lost" without also
+          // marking the primary batch's comments as posted — echoPosted scans
+          // ALL batch calls, and the two calls share comment IDs.
+          if (opts.echoBatchIdx != null) {
+            let seen = -1;
+            for (const call of createReviewCalls) {
+              if ((call.body || "") !== REVIEW_TAG) continue;
+              seen++;
+              if (seen !== opts.echoBatchIdx) continue;
+              return {
+                data: (call.comments || []).map((c) => ({
+                  path: c.path,
+                  body: c.body,
+                  side: c.side || "RIGHT",
+                  start_line: c.start_line,
+                  line: c.line,
+                })),
+              };
+            }
+            return { data: [] };
+          }
           if (opts.echoPosted || opts.landedKeys) {
             const byId = new Map();
             const add = (c) => {
@@ -289,19 +320,6 @@ function makeGithub(opts = {}) {
           return { data: { id: params.comment_id, html_url: `http://ex/u${updatedComments.length}` } };
         },
       },
-    paginate: {
-      iterator: (fn, params) => {
-        if (fn === mockObj.rest.pulls.listFiles) {
-          const data = opts.files || [];
-          return (async function* () {
-            yield { data };
-          })();
-        }
-        return (async function* () {
-          yield { data: [] };
-        })();
-      },
-    },
     },
   };
 }
@@ -2139,48 +2157,174 @@ async function main() {
   await testAccountingReconcilesToTotal();
   await testMalformedRoutingPolicyFailsOpen();
   await testRoutedFindingsCarryNoIdempotencyId();
-  // Diff hunk parsing & 422 fallback
-  testParseDiffHunkLines();
-  testIsCommentInDiffHunks();
+  // Diff hunk parsing & 422 line-resolution fallback
+  testParseDiffHunkRanges();
+  testClassifyCommentAgainstDiff();
+  testIsLineResolutionFailure();
+  testDescribeCommentLocation();
   await testGetPrDiffHunks();
+  await testGetPrDiffHunksTruncationIsIncomplete();
   await testHttp422SecondaryFilteredBatchFallback();
+  await testHttp422SecondaryFailureReconcilesInsteadOfDuplicating();
+  await testHttp422SecondaryFailureFallsBackWhenNothingLanded();
+  await testHttp422SecondaryRateLimitCoolsDownBeforeRetrying();
+  await testNonLineResolution422SkipsFilteredBatch();
+  await testUnknownDiffMetadataStillPostsComments();
+  await testDiffFetchFailureDegradesToPerComment();
+  await testAllCommentsFilteredOutAccounting();
+  await testCrossHunkRangeIsFilteredOut();
   console.log("All post-review-comments tests passed.");
 }
-function testParseDiffHunkLines() {
+function testParseDiffHunkRanges() {
   const patch = `@@ -10,3 +10,4 @@
  context line 10
 -deleted line 11
 +added line 11
 +added line 12
  context line 13`;
-  const valid = parseDiffHunkLines(patch);
-  assert.strictEqual(valid.has(10), true);
-  assert.strictEqual(valid.has(11), true);
-  assert.strictEqual(valid.has(12), true);
-  assert.strictEqual(valid.has(13), true);
-  assert.strictEqual(valid.has(14), false);
-  assert.strictEqual(valid.has(9), false);
-  assert.strictEqual(parseDiffHunkLines("").size, 0);
+  const ranges = parseDiffHunkRanges(patch);
+  assert.deepStrictEqual(ranges, [{ start: 10, end: 13 }]);
+
+  // Two hunks stay SEPARATE ranges: the gap between them is not commentable,
+  // and a span straddling both is not a legal multi-line comment.
+  const twoHunks = `@@ -1,3 +1,3 @@
+ a
+ b
+ c
+@@ -50,3 +50,3 @@
+ x
+ y
+ z`;
+  assert.deepStrictEqual(parseDiffHunkRanges(twoHunks), [
+    { start: 1, end: 3 },
+    { start: 50, end: 52 },
+  ]);
+
+  // A pure-deletion hunk has no RIGHT-side lines at all.
+  assert.deepStrictEqual(parseDiffHunkRanges("@@ -5,2 +4,0 @@\n-gone\n-also gone"), []);
+
+  // "\\ No newline at end of file" must not advance the line counter.
+  const noNewline = `@@ -1,1 +1,2 @@
+ kept
++added
+\\ No newline at end of file`;
+  assert.deepStrictEqual(parseDiffHunkRanges(noNewline), [{ start: 1, end: 2 }]);
+
+  // A trailing newline in the patch string yields a bare "" after split; it is
+  // not a diff body line and must not extend the range.
+  assert.deepStrictEqual(parseDiffHunkRanges("@@ -1,1 +1,1 @@\n context\n"), [{ start: 1, end: 1 }]);
+
+  assert.deepStrictEqual(parseDiffHunkRanges(""), []);
+  assert.deepStrictEqual(parseDiffHunkRanges(null), []);
 }
 
-function testIsCommentInDiffHunks() {
-  const hunkMap = new Map();
-  hunkMap.set("foo.js", new Set([10, 11, 12]));
-  const itemValid = { reviewComment: { path: "foo.js", line: 11 } };
-  const itemInvalid = { reviewComment: { path: "foo.js", line: 50 } };
-  const itemMissingFile = { reviewComment: { path: "bar.js", line: 10 } };
+function testClassifyCommentAgainstDiff() {
+  const diff = {
+    complete: true,
+    known: new Set(["foo.js", "binary.png"]),
+    files: new Map([["foo.js", [{ start: 10, end: 12 }, { start: 50, end: 52 }]]]),
+  };
+  const at = (rc) => classifyCommentAgainstDiff({ reviewComment: rc }, diff);
 
-  assert.strictEqual(isCommentInDiffHunks(itemValid, hunkMap), true);
-  assert.strictEqual(isCommentInDiffHunks(itemInvalid, hunkMap), false);
-  assert.strictEqual(isCommentInDiffHunks(itemMissingFile, hunkMap), false);
+  // Single line inside a hunk.
+  assert.strictEqual(at({ path: "foo.js", line: 11 }), "valid");
+  // Single line outside every hunk.
+  assert.strictEqual(at({ path: "foo.js", line: 30 }), "invalid");
+  // File not in the PR at all.
+  assert.strictEqual(at({ path: "bar.js", line: 10 }), "invalid");
+
+  // Multi-line span wholly inside ONE hunk.
+  assert.strictEqual(at({ path: "foo.js", start_line: 10, line: 12 }), "valid");
+  // Span straddling two hunks: both endpoints exist, but not in the same hunk.
+  // A flat line-set would wrongly call this valid and 422 all over again.
+  assert.strictEqual(at({ path: "foo.js", start_line: 11, line: 51 }), "invalid");
+  // Reversed span.
+  assert.strictEqual(at({ path: "foo.js", start_line: 52, line: 11 }), "invalid");
+  // Span partially overhanging the end of a hunk.
+  assert.strictEqual(at({ path: "foo.js", start_line: 11, line: 13 }), "invalid");
+
+  // ---- "unknown" must never be reported as "invalid" ----
+  // File is in the PR but GitHub omitted its patch (binary / oversized diff).
+  assert.strictEqual(at({ path: "binary.png", line: 3 }), "unknown");
+  // No line information to check.
+  assert.strictEqual(at({ path: "foo.js", line: null }), "unknown");
+  // LEFT-side comment: we only model RIGHT-side lines.
+  assert.strictEqual(at({ path: "foo.js", line: 11, side: "LEFT" }), "unknown");
+  // A truncated inventory proves nothing about an absent path.
+  assert.strictEqual(
+    classifyCommentAgainstDiff({ reviewComment: { path: "bar.js", line: 1 } }, { ...diff, complete: false }),
+    "unknown"
+  );
+  // No inventory at all (the fetch failed).
+  assert.strictEqual(classifyCommentAgainstDiff({ reviewComment: { path: "foo.js", line: 11 } }, null), "unknown");
+}
+
+function testIsLineResolutionFailure() {
+  // GitHub's own wording for this failure.
+  assert.strictEqual(isLineResolutionFailure({ message: "Validation Failed: line must be part of the diff" }), true);
+  assert.strictEqual(isLineResolutionFailure({ message: "Line could not be resolved" }), true);
+  // Structured validation error naming a line field is conclusive regardless
+  // of how the message is worded.
+  assert.strictEqual(
+    isLineResolutionFailure({ message: "Validation Failed", response: { data: { errors: [{ field: "start_line", code: "invalid" }] } } }),
+    true
+  );
+  assert.strictEqual(
+    isLineResolutionFailure({ message: "Validation Failed", errors: [{ message: "pull_request_review_thread.line must be part of the diff" }] }),
+    true
+  );
+
+  // 422 on this endpoint also means "the endpoint has been spammed" — that must
+  // NOT be read as a line-resolution problem, or the fallback would re-send a
+  // batch into a throttled endpoint.
+  assert.strictEqual(isLineResolutionFailure({ message: "You have exceeded a secondary rate limit" }), false);
+  assert.strictEqual(isLineResolutionFailure({ message: "Validation Failed: body is too long" }), false);
+  assert.strictEqual(isLineResolutionFailure({ message: "Validation Failed" }), false);
+  assert.strictEqual(isLineResolutionFailure({}), false);
+  assert.strictEqual(isLineResolutionFailure(null), false);
+}
+
+function testDescribeCommentLocation() {
+  assert.strictEqual(describeCommentLocation({ line: 42 }), "Line 42");
+  // A range that failed on start_line must not be described by its (valid) end
+  // line alone.
+  assert.strictEqual(describeCommentLocation({ start_line: 40, line: 42 }), "Lines 40-42");
+  assert.strictEqual(describeCommentLocation({ start_line: 42, line: 42 }), "Line 42");
+  assert.strictEqual(describeCommentLocation({}), "Line n/a");
 }
 
 async function testGetPrDiffHunks() {
-  const files = [{ filename: "src/main.js", patch: "@@ -1,2 +1,2 @@\n context 1\n+added 2" }];
+  const files = [
+    { filename: "src/main.js", patch: "@@ -1,2 +1,2 @@\n context 1\n+added 2" },
+    { filename: "assets/logo.png" }, // no patch (binary)
+  ];
   const gh = makeGithub({ files });
-  const hunkMap = await getPrDiffHunks({ github: gh, owner: "owner", repo: "repo", prNumber: 123 });
-  assert.strictEqual(hunkMap.has("src/main.js"), true);
-  assert.strictEqual(hunkMap.get("src/main.js").has(2), true);
+  const diff = await getPrDiffHunks({ github: gh, owner: "owner", repo: "repo", prNumber: 123, log: () => {} });
+  assert.strictEqual(diff.complete, true);
+  assert.deepStrictEqual(diff.files.get("src/main.js"), [{ start: 1, end: 2 }]);
+  // A patchless file is KNOWN (so it is not "not in the PR") but has no ranges.
+  assert.strictEqual(diff.known.has("assets/logo.png"), true);
+  assert.strictEqual(diff.files.has("assets/logo.png"), false);
+
+  // Cache: a second call for the same run must not re-fetch.
+  const cache = {};
+  const gh2 = makeGithub({ files });
+  await getPrDiffHunks({ github: gh2, owner: "o", repo: "r", prNumber: 1, log: () => {}, cache });
+  const afterFirst = gh2.listFilesCalls.length;
+  await getPrDiffHunks({ github: gh2, owner: "o", repo: "r", prNumber: 1, log: () => {}, cache });
+  assert.strictEqual(gh2.listFilesCalls.length, afterFirst, "cached diff inventory must not re-fetch listFiles");
+}
+
+async function testGetPrDiffHunksTruncationIsIncomplete() {
+  // 30 pages x 100 files is the GitHub listFiles ceiling; a PR at or past it
+  // yields an inventory we must not treat as authoritative.
+  const files = [];
+  for (let i = 0; i < 3100; i++) files.push({ filename: `f${i}.js`, patch: "@@ -1,1 +1,1 @@\n a" });
+  const gh = makeGithub({ files });
+  const diff = await getPrDiffHunks({ github: gh, owner: "o", repo: "r", prNumber: 1, log: () => {} });
+  assert.strictEqual(diff.complete, false, "a truncated file walk must report complete=false");
+  // ...and an incomplete inventory must never condemn a comment.
+  assert.strictEqual(classifyCommentAgainstDiff({ reviewComment: { path: "nope.js", line: 1 } }, diff), "unknown");
 }
 
 async function testHttp422SecondaryFilteredBatchFallback() {
@@ -2189,8 +2333,8 @@ async function testHttp422SecondaryFilteredBatchFallback() {
   ];
   const result = {
     comments: [
-      { path: "src/valid.js", start_line: 2, end_line: 2, severity: "high", category: "bug", comment: "valid comment" },
-      { path: "src/invalid.js", start_line: 99, end_line: 99, severity: "high", category: "bug", comment: "out of diff comment" },
+      { path: "src/valid.js", content: "valid comment", start_line: 2, end_line: 2, severity: "high", category: "bug" },
+      { path: "src/invalid.js", content: "out of diff comment", start_line: 99, end_line: 99, severity: "high", category: "bug" },
     ],
   };
 
@@ -2208,11 +2352,9 @@ async function testHttp422SecondaryFilteredBatchFallback() {
     out: {},
   });
 
-  // Initial batch createReview failed with 422.
-  // Secondary batch createReview was attempted with ONLY the surviving valid comment (src/valid.js).
-  // Verify createReviewCalls:
   // Call #0: initial batch (body === REVIEW_TAG, 2 comments) -> threw 422.
-  // Call #1: secondary filtered batch (body === REVIEW_TAG, 1 valid comment src/valid.js) -> succeeded!
+  // Call #1: secondary filtered batch (1 surviving comment) -> succeeded.
+  // No per-comment calls: the whole point of the fallback.
   assert.strictEqual(gh.createReviewCalls.length, 2, "Expected 2 createReview calls (initial batch + secondary filtered batch)");
   const secondaryCall = gh.createReviewCalls[1];
   assert.strictEqual(secondaryCall.comments.length, 1, "Secondary batch should contain only 1 valid comment");
@@ -2225,6 +2367,256 @@ async function testHttp422SecondaryFilteredBatchFallback() {
   assert.strictEqual(summaryText.includes("Line 99 could not be resolved"), true);
 }
 
+// REGRESSION: a secondary batch that LANDS but whose response is lost (5xx /
+// network error) must be reconciled, not blindly re-posted. Without this, every
+// surviving comment is duplicated — reintroducing exactly the churn the 422
+// fallback exists to remove.
+async function testHttp422SecondaryFailureReconcilesInsteadOfDuplicating() {
+  const files = [{ filename: "src/valid.js", patch: "@@ -1,3 +1,3 @@\n a\n b\n c" }];
+  const result = {
+    comments: [
+      { path: "src/valid.js", content: "c1", start_line: 1, end_line: 1 },
+      { path: "src/valid.js", content: "c2", start_line: 2, end_line: 2 },
+    ],
+  };
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [
+      { message: "Line could not be resolved", status: 422 },
+      { message: "Bad gateway", status: 502 },
+    ],
+    batchLanded: true, // listReviews reports a review carrying this run's tag
+    echoBatchIdx: 1, // ...and the SECONDARY batch's comments are on the server
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  assert.strictEqual(
+    gh.createReviewCalls.length,
+    2,
+    "secondary batch landed: no comment may be re-posted individually"
+  );
+  assert.strictEqual(gh.listReviewsCalls.length > 0, true, "secondary 5xx must trigger the idempotency read");
+  assert.strictEqual(gh.listReviewCommentsCalls.length > 0, true, "secondary 5xx must reconcile against posted comment IDs");
+  const summaryText = gh.updatedComments[0].body;
+  assert.strictEqual(summaryText.includes("Successfully posted inline: 2 comment(s)"), true);
+  // buildSummaryBody omits the failed line entirely when the count is zero.
+  assert.strictEqual(summaryText.includes("Failed to post inline"), false);
+}
+
+// The mirror case: the secondary batch genuinely did NOT land, so the
+// per-comment loop must still run and post every surviving comment exactly once.
+async function testHttp422SecondaryFailureFallsBackWhenNothingLanded() {
+  const files = [{ filename: "src/valid.js", patch: "@@ -1,3 +1,3 @@\n a\n b\n c" }];
+  const result = {
+    comments: [
+      { path: "src/valid.js", content: "c1", start_line: 1, end_line: 1 },
+      { path: "src/valid.js", content: "c2", start_line: 2, end_line: 2 },
+    ],
+  };
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [
+      { message: "Line could not be resolved", status: 422 },
+      { message: "Bad gateway", status: 502 },
+    ],
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  // 2 batch calls + 2 per-comment calls.
+  assert.strictEqual(gh.createReviewCalls.length, 4);
+  assert.strictEqual(gh.listReviewsCalls.length > 0, true, "secondary 5xx must still check whether the review landed");
+  const summaryText = gh.updatedComments[0].body;
+  assert.strictEqual(summaryText.includes("Successfully posted inline: 2 comment(s)"), true);
+}
+
+// A 429/403 rate-limit error surfacing from the secondary batch must cool down
+// (honoring Retry-After) before the per-comment loop issues another write.
+async function testHttp422SecondaryRateLimitCoolsDownBeforeRetrying() {
+  const realBase = process.env.OCR_RETRY_BASE_DELAY;
+  process.env.OCR_RETRY_BASE_DELAY = "1";
+  const logs = [];
+  try {
+    const files = [{ filename: "src/valid.js", patch: "@@ -1,2 +1,2 @@\n a\n b" }];
+    const result = { comments: [{ path: "src/valid.js", content: "c1", start_line: 1, end_line: 1 }] };
+    const gh = makeGithub({
+      files,
+      batchErrorSpec: [
+        { message: "Line could not be resolved", status: 422 },
+        { message: "You have exceeded a secondary rate limit", status: 429, headers: { "retry-after": "0" } },
+      ],
+    });
+
+    await runPostReviewComments({
+      github: gh,
+      context,
+      // runPostReviewComments logs through core.info when available.
+      core: { setOutput() {}, info: (m) => logs.push(m) },
+      fs: mockFs(JSON.stringify(result), ""),
+      out: {},
+    });
+
+    const cooled = logs.some((m) => /Secondary filtered batch createReview failed \(HTTP 429\)\. Cooling down/.test(m));
+    assert.strictEqual(cooled, true, "secondary rate-limit must cool down before any further write");
+    // 429 cannot have created the review, so no idempotency read should fire.
+    assert.strictEqual(gh.listReviewsCalls.length, 0, "a 429 rejects before creation; no idempotency read needed");
+  } finally {
+    if (realBase === undefined) delete process.env.OCR_RETRY_BASE_DELAY;
+    else process.env.OCR_RETRY_BASE_DELAY = realBase;
+  }
+}
+
+// A 422 that is NOT a line-resolution failure (GitHub returns 422 for spam
+// detection too) must not activate the filter or re-send a batch.
+async function testNonLineResolution422SkipsFilteredBatch() {
+  const files = [{ filename: "src/valid.js", patch: "@@ -1,2 +1,2 @@\n a\n b" }];
+  const result = { comments: [{ path: "src/valid.js", content: "c1", start_line: 1, end_line: 1 }] };
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [{ message: "Validation Failed: the endpoint has been spammed", status: 422 }],
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  assert.strictEqual(gh.listFilesCalls.length, 0, "an unrecognized 422 must not fetch the diff inventory");
+  // Batch call + per-comment call only — no secondary batch.
+  assert.strictEqual(gh.createReviewCalls.length, 2);
+  assert.strictEqual(gh.createReviewCalls[1].body, "", "second call must be the per-comment fallback, not a batch");
+}
+
+// REGRESSION: a file whose patch GitHub omitted (binary / oversized diff) is
+// UNKNOWN, not out-of-diff. Its comments must still be attempted individually
+// rather than silently routed to the summary.
+async function testUnknownDiffMetadataStillPostsComments() {
+  const files = [{ filename: "src/huge.js" }]; // in the PR, but no `patch`
+  const result = {
+    comments: [
+      { path: "src/huge.js", content: "c1", start_line: 1, end_line: 1 },
+      { path: "src/huge.js", content: "c2", start_line: 2, end_line: 2 },
+    ],
+  };
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [{ message: "Line could not be resolved", status: 422 }],
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  // Batch (422) + 2 per-comment calls. No secondary batch (nothing was provably
+  // valid), and critically NOTHING was discarded.
+  assert.strictEqual(gh.createReviewCalls.length, 3);
+  const summaryText = gh.updatedComments[0].body;
+  assert.strictEqual(summaryText.includes("Successfully posted inline: 2 comment(s)"), true);
+  // buildSummaryBody omits the failed line entirely when the count is zero.
+  assert.strictEqual(summaryText.includes("Failed to post inline"), false);
+}
+
+// When the diff inventory fetch itself fails, every comment is unknown and the
+// original per-comment behavior is preserved.
+async function testDiffFetchFailureDegradesToPerComment() {
+  const result = { comments: [{ path: "src/a.js", content: "c1", start_line: 1, end_line: 1 }] };
+  const gh = makeGithub({
+    listFilesThrow: true,
+    batchErrorSpec: [{ message: "Line could not be resolved", status: 422 }],
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  assert.strictEqual(gh.createReviewCalls.length, 2, "batch + per-comment fallback");
+  assert.strictEqual(gh.updatedComments[0].body.includes("Successfully posted inline: 1 comment(s)"), true);
+}
+
+// All comments provably out of diff: nothing is posted, accounting still
+// reconciles, and no stray createReview is issued.
+async function testAllCommentsFilteredOutAccounting() {
+  const files = [{ filename: "src/a.js", patch: "@@ -1,2 +1,2 @@\n a\n b" }];
+  const result = {
+    comments: [
+      { path: "src/a.js", content: "c1", start_line: 90, end_line: 90 },
+      { path: "src/gone.js", content: "c2", start_line: 1, end_line: 1 },
+    ],
+  };
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [{ message: "Line could not be resolved", status: 422 }],
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  assert.strictEqual(gh.createReviewCalls.length, 1, "nothing survivable: only the original failed batch");
+  const summaryText = gh.updatedComments[0].body;
+  assert.strictEqual(summaryText.includes("Successfully posted inline: 0 comment(s)"), true);
+  assert.strictEqual(summaryText.includes("Failed to post inline: 2 comment(s)"), true);
+  assert.strictEqual(summaryText.includes("Line 90 could not be resolved"), true);
+}
+
+// A multi-line span straddling two hunks is provably invalid; the in-hunk span
+// beside it still goes out in the grouped secondary batch.
+async function testCrossHunkRangeIsFilteredOut() {
+  const files = [{ filename: "src/a.js", patch: "@@ -1,3 +1,3 @@\n a\n b\n c\n@@ -50,3 +50,3 @@\n x\n y\n z" }];
+  const result = {
+    comments: [
+      { path: "src/a.js", content: "straddles two hunks", start_line: 2, end_line: 51 },
+      { path: "src/a.js", content: "inside one hunk", start_line: 50, end_line: 52 },
+    ],
+  };
+  const gh = makeGithub({
+    files,
+    batchErrorSpec: [{ message: "Line could not be resolved", status: 422 }],
+  });
+
+  await runPostReviewComments({
+    github: gh,
+    context,
+    core: { setOutput() {} },
+    fs: mockFs(JSON.stringify(result), ""),
+    out: {},
+  });
+
+  assert.strictEqual(gh.createReviewCalls.length, 2);
+  assert.strictEqual(gh.createReviewCalls[1].comments.length, 1, "only the single-hunk span may be re-batched");
+  assert.strictEqual(gh.createReviewCalls[1].comments[0].start_line, 50);
+  const summaryText = gh.updatedComments[0].body;
+  // The failure names the whole span, not just its (valid) end line.
+  assert.strictEqual(summaryText.includes("Lines 2-51 could not be resolved"), true);
+}
 
 main().catch((err) => {
   console.error(err);
