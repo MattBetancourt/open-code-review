@@ -190,3 +190,8 @@ This project exists thanks to all the people who contribute. See [CONTRIBUTING.m
 ## License
 
 [Apache-2.0](LICENSE) — Copyright 2026 Alibaba
+
+<!-- scratch: live 422 probe (do not merge) -->
+<!-- probe line A -->
+<!-- probe line B -->
+<!-- probe line C -->
